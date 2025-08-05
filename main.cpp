@@ -80,6 +80,50 @@ struct OrderExecutedMessage {
   uint64_t matchNumber;
 };
 
+// From ITCH 5.0 specification, section 1.4.2
+struct OrderExecutedWithPriceMessage {
+  char messageType;
+  uint16_t stockLocate;
+  uint16_t trackingNumber;
+  uint8_t timestamp[6];
+  uint64_t orderReferenceNumber;
+  uint32_t executedShares;
+  uint64_t matchNumber;
+  char printable;
+  uint32_t executionPrice;
+};
+
+// From ITCH 5.0 specification, section 1.4.3
+struct OrderCancelMessage {
+  char messageType;
+  uint16_t stockLocate;
+  uint16_t trackingNumber;
+  uint8_t timestamp[6];
+  uint64_t orderReferenceNumber;
+  uint32_t canceledShares;
+};
+
+// From ITCH 5.0 specification, section 1.4.4
+struct OrderDeleteMessage {
+  char messageType;
+  uint16_t stockLocate;
+  uint16_t trackingNumber;
+  uint8_t timestamp[6];
+  uint64_t orderReferenceNumber;
+};
+
+// From ITCH 5.0 specification, section 1.4.5
+struct OrderReplaceMessage {
+  char messageType;
+  uint16_t stockLocate;
+  uint16_t trackingNumber;
+  uint8_t timestamp[6];
+  uint64_t originalOrderReferenceNumber;
+  uint64_t newOrderReferenceNumber;
+  uint32_t shares;
+  uint32_t price;
+};
+
 #pragma pack(pop)
 
 // --- Helper Functions ---
@@ -176,6 +220,67 @@ void parseOrderExecutedMessage(const char *a_buffer) {
             << " | Match #: " << matchNumber << std::endl;
 }
 
+void parseOrderExecutedWithPriceMessage(const char *a_buffer) {
+  OrderExecutedWithPriceMessage msg;
+  std::memcpy(&msg, a_buffer, sizeof(OrderExecutedWithPriceMessage));
+
+  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
+  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
+  uint32_t executedShares = ntohl(msg.executedShares);
+  uint64_t matchNumber = __builtin_bswap64(msg.matchNumber);
+  double executionPrice = ntohl(msg.executionPrice) / 10000.0;
+
+  std::cout << "\n--- Parsed Order Executed w/ Price ('C') ---" << std::endl;
+  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
+            << std::endl;
+  std::cout << "Executed Shares: " << executedShares
+            << " | Match #: " << matchNumber << " | Price: " << executionPrice
+            << std::endl;
+}
+
+void parseOrderCancelMessage(const char *a_buffer) {
+  OrderCancelMessage msg;
+  std::memcpy(&msg, a_buffer, sizeof(OrderCancelMessage));
+
+  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
+  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
+  uint32_t canceledShares = ntohl(msg.canceledShares);
+
+  std::cout << "\n--- Parsed Order Cancel ('X') ---" << std::endl;
+  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
+            << " | Canceled Shares: " << canceledShares << std::endl;
+}
+
+void parseOrderDeleteMessage(const char *a_buffer) {
+  OrderDeleteMessage msg;
+  std::memcpy(&msg, a_buffer, sizeof(OrderDeleteMessage));
+
+  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
+  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
+
+  std::cout << "\n--- Parsed Order Delete ('D') ---" << std::endl;
+  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
+            << std::endl;
+}
+
+void parseOrderReplaceMessage(const char *a_buffer) {
+  OrderReplaceMessage msg;
+  std::memcpy(&msg, a_buffer, sizeof(OrderReplaceMessage));
+
+  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
+  uint64_t originalOrderRef =
+      __builtin_bswap64(msg.originalOrderReferenceNumber);
+  uint64_t newOrderRef = __builtin_bswap64(msg.newOrderReferenceNumber);
+  uint32_t shares = ntohl(msg.shares);
+  double price = ntohl(msg.price) / 10000.0;
+
+  std::cout << "\n--- Parsed Order Replace ('U') ---" << std::endl;
+  std::cout << "Timestamp: " << timestamp << " | Orig Ref: " << originalOrderRef
+            << " -> New Ref: " << newOrderRef << std::endl;
+  std::cout << "New Shares: " << shares << " | New Price: " << price
+            << std::endl;
+}
+
 // --- Main ---
 int main() {
   std::ifstream file("../test_data.bin", std::ios::binary);
@@ -218,6 +323,22 @@ int main() {
     case 'E':
       messageLength = sizeof(OrderExecutedMessage);
       parseOrderExecutedMessage(current_pos);
+      break;
+    case 'C':
+      messageLength = sizeof(OrderExecutedWithPriceMessage);
+      parseOrderExecutedWithPriceMessage(current_pos);
+      break;
+    case 'X':
+      messageLength = sizeof(OrderCancelMessage);
+      parseOrderCancelMessage(current_pos);
+      break;
+    case 'D':
+      messageLength = sizeof(OrderDeleteMessage);
+      parseOrderDeleteMessage(current_pos);
+      break;
+    case 'U':
+      messageLength = sizeof(OrderReplaceMessage);
+      parseOrderReplaceMessage(current_pos);
       break;
     default:
       std::cerr << "\nWarning: Unknown or unhandled message type: '"
