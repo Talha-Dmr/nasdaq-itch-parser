@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <netinet/in.h>
 #include <queue>
@@ -22,7 +23,6 @@ void listen_feed(const char *group, int port, char feed_id) {
     perror("socket");
     return;
   }
-
   int reuse = 1;
   if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse,
                  sizeof(reuse)) < 0) {
@@ -30,7 +30,6 @@ void listen_feed(const char *group, int port, char feed_id) {
     close(sock);
     return;
   }
-
   struct sockaddr_in local_addr;
   memset(&local_addr, 0, sizeof(local_addr));
   local_addr.sin_family = AF_INET;
@@ -41,7 +40,6 @@ void listen_feed(const char *group, int port, char feed_id) {
     close(sock);
     return;
   }
-
   struct ip_mreq mreq;
   mreq.imr_multiaddr.s_addr = inet_addr(group);
   mreq.imr_interface.s_addr = htonl(INADDR_ANY);
@@ -51,10 +49,8 @@ void listen_feed(const char *group, int port, char feed_id) {
     close(sock);
     return;
   }
-
   std::cout << "Thread for Feed '" << feed_id << "' is listening on port "
             << port << std::endl;
-
   char recv_buffer[4096];
   while (true) {
     ssize_t nbytes =
@@ -68,19 +64,53 @@ void listen_feed(const char *group, int port, char feed_id) {
   close(sock);
 }
 
-// --- Main Function (Application Logic) ---
+// --- Helper function to dispatch parsing ---
+void dispatch_parse_call(const char *buffer) {
+  char messageType = buffer[0];
+  switch (messageType) {
+  case 'S':
+    parseSystemEventMessage(buffer);
+    break;
+  case 'R':
+    parseStockDirectoryMessage(buffer);
+    break;
+  case 'A':
+    parseAddOrderMessage(buffer);
+    break;
+  case 'F':
+    parseAddOrderWithMPIDMessage(buffer);
+    break;
+  case 'E':
+    parseOrderExecutedMessage(buffer);
+    break;
+  case 'C':
+    parseOrderExecutedWithPriceMessage(buffer);
+    break;
+  case 'X':
+    parseOrderCancelMessage(buffer);
+    break;
+  case 'D':
+    parseOrderDeleteMessage(buffer);
+    break;
+  case 'U':
+    parseOrderReplaceMessage(buffer);
+    break;
+  }
+}
+
+// --- Main Function (Updated with Advanced Gap Handling) ---
 int main() {
   const char *MCAST_GROUP = "239.0.0.1";
   const int MCAST_PORT_A = 5007;
   const int MCAST_PORT_B = 5008;
-
-  std::cout << "Launching listener threads..." << std::endl;
   std::thread feed_a_thread(listen_feed, MCAST_GROUP, MCAST_PORT_A, 'A');
   std::thread feed_b_thread(listen_feed, MCAST_GROUP, MCAST_PORT_B, 'B');
 
   uint64_t expected_tracking_number = 1;
+  std::map<uint64_t, std::vector<char>> gap_buffer;
 
-  std::cout << "Starting processor loop with arbitration logic..." << std::endl;
+  std::cout << "Starting processor loop with ADVANCED arbitration logic..."
+            << std::endl;
   while (true) {
     std::vector<char> packet_to_process;
     {
@@ -127,75 +157,45 @@ int main() {
           messageLength = sizeof(OrderReplaceMessage);
           break;
         default:
-          std::cerr << "\nWarning: Unknown message type '" << messageType
-                    << "'." << std::endl;
           current_pos = end_pos;
           continue;
         }
-
-        if (messageLength == 0) {
+        if (messageLength == 0 || (current_pos + messageLength > end_pos))
           break;
-        }
-        if (current_pos + messageLength > end_pos) {
-          std::cerr << "Error: Incomplete message." << std::endl;
-          break;
-        }
 
         CommonHeader header;
         std::memcpy(&header, current_pos, sizeof(CommonHeader));
         uint16_t incoming_tracking_number = ntohs(header.trackingNumber);
 
-        bool is_duplicate = false;
         if (incoming_tracking_number != 0) {
           if (incoming_tracking_number < expected_tracking_number) {
-            is_duplicate = true;
-            std::cout << "\n[Arbitrator] Duplicate message #"
-                      << incoming_tracking_number << " received. Skipping."
-                      << std::endl;
+            // It's a duplicate, do nothing.
           } else if (incoming_tracking_number > expected_tracking_number) {
-            std::cout << "\n[Arbitrator] GAP DETECTED! Expected: "
-                      << expected_tracking_number
-                      << ", but received: " << incoming_tracking_number
-                      << std::endl;
-            expected_tracking_number = incoming_tracking_number;
-          }
-          if (incoming_tracking_number >= expected_tracking_number) {
+            if (gap_buffer.find(incoming_tracking_number) == gap_buffer.end()) {
+              std::cout
+                  << "\n[Arbitrator] Gap detected. Buffering future message #"
+                  << incoming_tracking_number << std::endl;
+              std::vector<char> msg_copy(current_pos,
+                                         current_pos + messageLength);
+              gap_buffer[incoming_tracking_number] = msg_copy;
+            }
+          } else {
+            dispatch_parse_call(current_pos);
             expected_tracking_number++;
           }
+        } else {
+          dispatch_parse_call(current_pos);
         }
 
-        if (!is_duplicate) {
-          switch (messageType) {
-          case 'S':
-            parseSystemEventMessage(current_pos);
-            break;
-          case 'R':
-            parseStockDirectoryMessage(current_pos);
-            break;
-          case 'A':
-            parseAddOrderMessage(current_pos);
-            break;
-          case 'F':
-            parseAddOrderWithMPIDMessage(current_pos);
-            break;
-          case 'E':
-            parseOrderExecutedMessage(current_pos);
-            break;
-          case 'C':
-            parseOrderExecutedWithPriceMessage(current_pos);
-            break;
-          case 'X':
-            parseOrderCancelMessage(current_pos);
-            break;
-          case 'D':
-            parseOrderDeleteMessage(current_pos);
-            break;
-          case 'U':
-            parseOrderReplaceMessage(current_pos);
-            break;
-          }
+        while (gap_buffer.count(expected_tracking_number)) {
+          std::cout << "[Arbitrator] Processing buffered message #"
+                    << expected_tracking_number << " from gap." << std::endl;
+          const std::vector<char> &buffered_message_vec =
+              gap_buffer.at(expected_tracking_number);
+          dispatch_parse_call(buffered_message_vec.data());
+          gap_buffer.erase(expected_tracking_number);
+          expected_tracking_number++;
         }
-
         current_pos += messageLength;
       }
     } else {
