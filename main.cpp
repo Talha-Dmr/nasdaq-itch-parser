@@ -1,17 +1,32 @@
 #include <arpa/inet.h>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <iostream>
+#include <mutex>
+#include <netinet/in.h>
+#include <queue>
 #include <string>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
+// --- Global Shared Data ---
+// A thread-safe queue to hold incoming data packets.
+std::queue<std::vector<char>> g_packet_queue;
+// A mutex to protect access to the queue.
+std::mutex g_queue_mutex;
+
 // --- Struct Definitions ---
-// Ensure structs are packed without padding to match the exact network message
-// format.
 #pragma pack(push, 1)
 
-// From ITCH 5.0 specification, section 1.1
+struct CommonHeader {
+  char messageType;
+  uint16_t stockLocate;
+  uint16_t trackingNumber;
+};
+
 struct SystemEventMessage {
   char messageType;
   uint16_t stockLocate;
@@ -19,8 +34,6 @@ struct SystemEventMessage {
   uint8_t timestamp[6];
   char eventCode;
 };
-
-// From ITCH 5.0 specification, section 1.2.1
 struct StockDirectoryMessage {
   char messageType;
   uint16_t stockLocate;
@@ -41,8 +54,6 @@ struct StockDirectoryMessage {
   uint32_t etpLeverageFactor;
   char inverseIndicator;
 };
-
-// From ITCH 5.0 specification, section 1.3.1
 struct AddOrderMessage {
   char messageType;
   uint16_t stockLocate;
@@ -54,8 +65,6 @@ struct AddOrderMessage {
   char stockSymbol[8];
   uint32_t price;
 };
-
-// From ITCH 5.0 specification, section 1.3.2
 struct AddOrderWithMPIDMessage {
   char messageType;
   uint16_t stockLocate;
@@ -68,8 +77,6 @@ struct AddOrderWithMPIDMessage {
   uint32_t price;
   char attribution[4];
 };
-
-// From ITCH 5.0 specification, section 1.4.1
 struct OrderExecutedMessage {
   char messageType;
   uint16_t stockLocate;
@@ -79,8 +86,6 @@ struct OrderExecutedMessage {
   uint32_t executedShares;
   uint64_t matchNumber;
 };
-
-// From ITCH 5.0 specification, section 1.4.2
 struct OrderExecutedWithPriceMessage {
   char messageType;
   uint16_t stockLocate;
@@ -92,8 +97,6 @@ struct OrderExecutedWithPriceMessage {
   char printable;
   uint32_t executionPrice;
 };
-
-// From ITCH 5.0 specification, section 1.4.3
 struct OrderCancelMessage {
   char messageType;
   uint16_t stockLocate;
@@ -102,8 +105,6 @@ struct OrderCancelMessage {
   uint64_t orderReferenceNumber;
   uint32_t canceledShares;
 };
-
-// From ITCH 5.0 specification, section 1.4.4
 struct OrderDeleteMessage {
   char messageType;
   uint16_t stockLocate;
@@ -111,8 +112,6 @@ struct OrderDeleteMessage {
   uint8_t timestamp[6];
   uint64_t orderReferenceNumber;
 };
-
-// From ITCH 5.0 specification, section 1.4.5
 struct OrderReplaceMessage {
   char messageType;
   uint16_t stockLocate;
@@ -139,9 +138,7 @@ uint64_t reconstructTimestamp(const uint8_t a_timestamp[6]) {
 void parseSystemEventMessage(const char *a_buffer) {
   SystemEventMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(SystemEventMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-
   std::cout << "\n--- Parsed System Event ('S') ---" << std::endl;
   std::cout << "Timestamp:  " << timestamp << std::endl;
   std::cout << "Event Code: " << msg.eventCode << std::endl;
@@ -150,14 +147,9 @@ void parseSystemEventMessage(const char *a_buffer) {
 void parseStockDirectoryMessage(const char *a_buffer) {
   StockDirectoryMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(StockDirectoryMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
   uint32_t roundLotSize = ntohl(msg.roundLotSize);
-
-  // Alpha fields are not null-terminated, so create a std::string with explicit
-  // length.
   std::string stockSymbol(msg.stockSymbol, sizeof(msg.stockSymbol));
-
   std::cout << "\n--- Parsed Stock Directory ('R') ---" << std::endl;
   std::cout << "Timestamp:    " << timestamp << std::endl;
   std::cout << "Stock Symbol: " << stockSymbol << std::endl;
@@ -167,15 +159,11 @@ void parseStockDirectoryMessage(const char *a_buffer) {
 void parseAddOrderMessage(const char *a_buffer) {
   AddOrderMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(AddOrderMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint64_t orderRef =
-      __builtin_bswap64(msg.orderReferenceNumber); // 8-byte swap
+  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
   uint32_t shares = ntohl(msg.shares);
-  double price = ntohl(msg.price) / 10000.0; // Price has 4 decimal places
-
+  double price = ntohl(msg.price) / 10000.0;
   std::string stockSymbol(msg.stockSymbol, sizeof(msg.stockSymbol));
-
   std::cout << "\n--- Parsed Add Order ('A') ---" << std::endl;
   std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
             << std::endl;
@@ -187,15 +175,12 @@ void parseAddOrderMessage(const char *a_buffer) {
 void parseAddOrderWithMPIDMessage(const char *a_buffer) {
   AddOrderWithMPIDMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(AddOrderWithMPIDMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
   uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
   uint32_t shares = ntohl(msg.shares);
   double price = ntohl(msg.price) / 10000.0;
-
   std::string stockSymbol(msg.stockSymbol, sizeof(msg.stockSymbol));
   std::string attribution(msg.attribution, sizeof(msg.attribution));
-
   std::cout << "\n--- Parsed Add Order w/ MPID ('F') ---" << std::endl;
   std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
             << std::endl;
@@ -207,12 +192,10 @@ void parseAddOrderWithMPIDMessage(const char *a_buffer) {
 void parseOrderExecutedMessage(const char *a_buffer) {
   OrderExecutedMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(OrderExecutedMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
   uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
   uint32_t executedShares = ntohl(msg.executedShares);
   uint64_t matchNumber = __builtin_bswap64(msg.matchNumber);
-
   std::cout << "\n--- Parsed Order Executed ('E') ---" << std::endl;
   std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
             << std::endl;
@@ -223,13 +206,11 @@ void parseOrderExecutedMessage(const char *a_buffer) {
 void parseOrderExecutedWithPriceMessage(const char *a_buffer) {
   OrderExecutedWithPriceMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(OrderExecutedWithPriceMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
   uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
   uint32_t executedShares = ntohl(msg.executedShares);
   uint64_t matchNumber = __builtin_bswap64(msg.matchNumber);
   double executionPrice = ntohl(msg.executionPrice) / 10000.0;
-
   std::cout << "\n--- Parsed Order Executed w/ Price ('C') ---" << std::endl;
   std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
             << std::endl;
@@ -241,11 +222,9 @@ void parseOrderExecutedWithPriceMessage(const char *a_buffer) {
 void parseOrderCancelMessage(const char *a_buffer) {
   OrderCancelMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(OrderCancelMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
   uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
   uint32_t canceledShares = ntohl(msg.canceledShares);
-
   std::cout << "\n--- Parsed Order Cancel ('X') ---" << std::endl;
   std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
             << " | Canceled Shares: " << canceledShares << std::endl;
@@ -254,10 +233,8 @@ void parseOrderCancelMessage(const char *a_buffer) {
 void parseOrderDeleteMessage(const char *a_buffer) {
   OrderDeleteMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(OrderDeleteMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
   uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
-
   std::cout << "\n--- Parsed Order Delete ('D') ---" << std::endl;
   std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
             << std::endl;
@@ -266,14 +243,12 @@ void parseOrderDeleteMessage(const char *a_buffer) {
 void parseOrderReplaceMessage(const char *a_buffer) {
   OrderReplaceMessage msg;
   std::memcpy(&msg, a_buffer, sizeof(OrderReplaceMessage));
-
   uint64_t timestamp = reconstructTimestamp(msg.timestamp);
   uint64_t originalOrderRef =
       __builtin_bswap64(msg.originalOrderReferenceNumber);
   uint64_t newOrderRef = __builtin_bswap64(msg.newOrderReferenceNumber);
   uint32_t shares = ntohl(msg.shares);
   double price = ntohl(msg.price) / 10000.0;
-
   std::cout << "\n--- Parsed Order Replace ('U') ---" << std::endl;
   std::cout << "Timestamp: " << timestamp << " | Orig Ref: " << originalOrderRef
             << " -> New Ref: " << newOrderRef << std::endl;
@@ -281,81 +256,200 @@ void parseOrderReplaceMessage(const char *a_buffer) {
             << std::endl;
 }
 
-// --- Main ---
+// --- Network Listener Function ---
+void listen_feed(const char *group, int port, char feed_id) {
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) {
+    perror("socket");
+    return;
+  }
+
+  int reuse = 1;
+  if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse,
+                 sizeof(reuse)) < 0) {
+    perror("setsockopt(SO_REUSEADDR)");
+    close(sock);
+    return;
+  }
+
+  struct sockaddr_in local_addr;
+  memset(&local_addr, 0, sizeof(local_addr));
+  local_addr.sin_family = AF_INET;
+  local_addr.sin_addr.s_addr = INADDR_ANY;
+  local_addr.sin_port = htons(port);
+  if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+    perror("bind");
+    close(sock);
+    return;
+  }
+
+  struct ip_mreq mreq;
+  mreq.imr_multiaddr.s_addr = inet_addr(group);
+  mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+  if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) <
+      0) {
+    perror("setsockopt(IP_ADD_MEMBERSHIP)");
+    close(sock);
+    return;
+  }
+
+  std::cout << "Thread for Feed '" << feed_id << "' is listening on port "
+            << port << std::endl;
+
+  char recv_buffer[4096];
+  while (true) {
+    ssize_t nbytes =
+        recvfrom(sock, recv_buffer, sizeof(recv_buffer), 0, NULL, 0);
+    if (nbytes > 0) {
+      std::vector<char> packet(recv_buffer, recv_buffer + nbytes);
+      std::lock_guard<std::mutex> lock(g_queue_mutex);
+      g_packet_queue.push(packet);
+    }
+  }
+  close(sock);
+}
+
+// --- Main Function ---
 int main() {
-  std::ifstream file("../test_data.bin", std::ios::binary);
-  if (!file) {
-    std::cerr << "Error: Could not open test_data.bin!" << std::endl;
-    return 1;
-  }
+  const char *MCAST_GROUP = "239.0.0.1";
+  const int MCAST_PORT_A = 5007;
+  const int MCAST_PORT_B = 5008;
 
-  std::vector<char> buffer((std::istreambuf_iterator<char>(file)),
-                           (std::istreambuf_iterator<char>()));
-  file.close();
+  std::cout << "Launching listener threads..." << std::endl;
+  std::thread feed_a_thread(listen_feed, MCAST_GROUP, MCAST_PORT_A, 'A');
+  std::thread feed_b_thread(listen_feed, MCAST_GROUP, MCAST_PORT_B, 'B');
 
-  // Loop through the buffer, processing one message at a time.
-  const char *current_pos = buffer.data();
-  const char *end_pos = buffer.data() + buffer.size();
+  uint64_t expected_tracking_number = 1;
 
-  while (current_pos < end_pos) {
-    char messageType = *current_pos;
-    unsigned int messageLength = 0;
-
-    // Determine message length based on type and dispatch to the correct
-    // parser.
-    switch (messageType) {
-    case 'S':
-      messageLength = sizeof(SystemEventMessage);
-      parseSystemEventMessage(current_pos);
-      break;
-    case 'R':
-      messageLength = sizeof(StockDirectoryMessage);
-      parseStockDirectoryMessage(current_pos);
-      break;
-    case 'A':
-      messageLength = sizeof(AddOrderMessage);
-      parseAddOrderMessage(current_pos);
-      break;
-    case 'F':
-      messageLength = sizeof(AddOrderWithMPIDMessage);
-      parseAddOrderWithMPIDMessage(current_pos);
-      break;
-    case 'E':
-      messageLength = sizeof(OrderExecutedMessage);
-      parseOrderExecutedMessage(current_pos);
-      break;
-    case 'C':
-      messageLength = sizeof(OrderExecutedWithPriceMessage);
-      parseOrderExecutedWithPriceMessage(current_pos);
-      break;
-    case 'X':
-      messageLength = sizeof(OrderCancelMessage);
-      parseOrderCancelMessage(current_pos);
-      break;
-    case 'D':
-      messageLength = sizeof(OrderDeleteMessage);
-      parseOrderDeleteMessage(current_pos);
-      break;
-    case 'U':
-      messageLength = sizeof(OrderReplaceMessage);
-      parseOrderReplaceMessage(current_pos);
-      break;
-    default:
-      std::cerr << "\nWarning: Unknown or unhandled message type: '"
-                << messageType << "'" << std::endl;
-      // To prevent an infinite loop on an unknown type, we must exit or
-      // advance.
-      return 1;
+  std::cout << "Starting processor loop with arbitration logic..." << std::endl;
+  while (true) {
+    std::vector<char> packet_to_process;
+    {
+      std::lock_guard<std::mutex> lock(g_queue_mutex);
+      if (!g_packet_queue.empty()) {
+        packet_to_process = g_packet_queue.front();
+        g_packet_queue.pop();
+      }
     }
 
-    if (messageLength == 0) {
-      std::cerr << "Error: Message with zero length. Aborting." << std::endl;
-      return 1;
-    }
+    if (!packet_to_process.empty()) {
+      const char *current_pos = packet_to_process.data();
+      const char *end_pos = packet_to_process.data() + packet_to_process.size();
 
-    // Advance the pointer to the next message
-    current_pos += messageLength;
+      while (current_pos < end_pos) {
+        char messageType = *current_pos;
+        unsigned int messageLength = 0;
+        switch (messageType) {
+        case 'S':
+          messageLength = sizeof(SystemEventMessage);
+          break;
+        case 'R':
+          messageLength = sizeof(StockDirectoryMessage);
+          break;
+        case 'A':
+          messageLength = sizeof(AddOrderMessage);
+          break;
+        case 'F':
+          messageLength = sizeof(AddOrderWithMPIDMessage);
+          break;
+        case 'E':
+          messageLength = sizeof(OrderExecutedMessage);
+          break;
+        case 'C':
+          messageLength = sizeof(OrderExecutedWithPriceMessage);
+          break;
+        case 'X':
+          messageLength = sizeof(OrderCancelMessage);
+          break;
+        case 'D':
+          messageLength = sizeof(OrderDeleteMessage);
+          break;
+        case 'U':
+          messageLength = sizeof(OrderReplaceMessage);
+          break;
+        default:
+          std::cerr << "\nWarning: Unknown message type '" << messageType
+                    << "' at offset "
+                    << (current_pos - packet_to_process.data())
+                    << ". Stopping processing of this packet." << std::endl;
+          current_pos = end_pos;
+          continue;
+        }
+
+        if (messageLength == 0) {
+          break;
+        }
+
+        if (current_pos + messageLength > end_pos) {
+          std::cerr << "Error: Incomplete message of type '" << messageType
+                    << "'. Aborting packet." << std::endl;
+          break;
+        }
+
+        CommonHeader header;
+        std::memcpy(&header, current_pos, sizeof(CommonHeader));
+        uint16_t incoming_tracking_number = ntohs(header.trackingNumber);
+
+        bool is_duplicate = false;
+        if (incoming_tracking_number != 0) {
+          if (incoming_tracking_number < expected_tracking_number) {
+            is_duplicate = true;
+            std::cout << "\n[Arbitrator] Duplicate message #"
+                      << incoming_tracking_number << " received. Skipping."
+                      << std::endl;
+          } else if (incoming_tracking_number > expected_tracking_number) {
+            std::cout << "\n[Arbitrator] GAP DETECTED! Expected: "
+                      << expected_tracking_number
+                      << ", but received: " << incoming_tracking_number
+                      << std::endl;
+            expected_tracking_number = incoming_tracking_number;
+          }
+
+          if (incoming_tracking_number >= expected_tracking_number) {
+            expected_tracking_number++;
+          }
+        }
+
+        if (!is_duplicate) {
+          switch (messageType) {
+          case 'S':
+            parseSystemEventMessage(current_pos);
+            break;
+          case 'R':
+            parseStockDirectoryMessage(current_pos);
+            break;
+          case 'A':
+            parseAddOrderMessage(current_pos);
+            break;
+          case 'F':
+            parseAddOrderWithMPIDMessage(current_pos);
+            break;
+          case 'E':
+            parseOrderExecutedMessage(current_pos);
+            break;
+          case 'C':
+            parseOrderExecutedWithPriceMessage(current_pos);
+            break;
+          case 'X':
+            parseOrderCancelMessage(current_pos);
+            break;
+          case 'D':
+            parseOrderDeleteMessage(current_pos);
+            break;
+          case 'U':
+            parseOrderReplaceMessage(current_pos);
+            break;
+          }
+        }
+
+        current_pos += messageLength;
+      }
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
   }
 
+  feed_a_thread.join();
+  feed_b_thread.join();
   return 0;
 }
