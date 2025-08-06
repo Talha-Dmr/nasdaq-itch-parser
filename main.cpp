@@ -1,260 +1,19 @@
+#include "itch_parser.hpp"
 #include <arpa/inet.h>
 #include <chrono>
-#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <mutex>
 #include <netinet/in.h>
 #include <queue>
-#include <string>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
 // --- Global Shared Data ---
-// A thread-safe queue to hold incoming data packets.
 std::queue<std::vector<char>> g_packet_queue;
-// A mutex to protect access to the queue.
 std::mutex g_queue_mutex;
-
-// --- Struct Definitions ---
-#pragma pack(push, 1)
-
-struct CommonHeader {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-};
-
-struct SystemEventMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  char eventCode;
-};
-struct StockDirectoryMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  char stockSymbol[8];
-  char marketCategory;
-  char financialStatusIndicator;
-  uint32_t roundLotSize;
-  char roundLotsOnly;
-  char issueClassification;
-  char issueSubType[2];
-  char authenticity;
-  char shortSaleThresholdIndicator;
-  char ipoFlag;
-  char luldReferencePriceTier;
-  char etpFlag;
-  uint32_t etpLeverageFactor;
-  char inverseIndicator;
-};
-struct AddOrderMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  uint64_t orderReferenceNumber;
-  char buySellIndicator;
-  uint32_t shares;
-  char stockSymbol[8];
-  uint32_t price;
-};
-struct AddOrderWithMPIDMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  uint64_t orderReferenceNumber;
-  char buySellIndicator;
-  uint32_t shares;
-  char stockSymbol[8];
-  uint32_t price;
-  char attribution[4];
-};
-struct OrderExecutedMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  uint64_t orderReferenceNumber;
-  uint32_t executedShares;
-  uint64_t matchNumber;
-};
-struct OrderExecutedWithPriceMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  uint64_t orderReferenceNumber;
-  uint32_t executedShares;
-  uint64_t matchNumber;
-  char printable;
-  uint32_t executionPrice;
-};
-struct OrderCancelMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  uint64_t orderReferenceNumber;
-  uint32_t canceledShares;
-};
-struct OrderDeleteMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  uint64_t orderReferenceNumber;
-};
-struct OrderReplaceMessage {
-  char messageType;
-  uint16_t stockLocate;
-  uint16_t trackingNumber;
-  uint8_t timestamp[6];
-  uint64_t originalOrderReferenceNumber;
-  uint64_t newOrderReferenceNumber;
-  uint32_t shares;
-  uint32_t price;
-};
-
-#pragma pack(pop)
-
-// --- Helper Functions ---
-uint64_t reconstructTimestamp(const uint8_t a_timestamp[6]) {
-  uint64_t timestamp = 0;
-  for (int i = 0; i < 6; ++i) {
-    timestamp = (timestamp << 8) | a_timestamp[i];
-  }
-  return timestamp;
-}
-
-// --- Message Parsers ---
-void parseSystemEventMessage(const char *a_buffer) {
-  SystemEventMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(SystemEventMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  std::cout << "\n--- Parsed System Event ('S') ---" << std::endl;
-  std::cout << "Timestamp:  " << timestamp << std::endl;
-  std::cout << "Event Code: " << msg.eventCode << std::endl;
-}
-
-void parseStockDirectoryMessage(const char *a_buffer) {
-  StockDirectoryMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(StockDirectoryMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint32_t roundLotSize = ntohl(msg.roundLotSize);
-  std::string stockSymbol(msg.stockSymbol, sizeof(msg.stockSymbol));
-  std::cout << "\n--- Parsed Stock Directory ('R') ---" << std::endl;
-  std::cout << "Timestamp:    " << timestamp << std::endl;
-  std::cout << "Stock Symbol: " << stockSymbol << std::endl;
-  std::cout << "Round Lot:    " << roundLotSize << std::endl;
-}
-
-void parseAddOrderMessage(const char *a_buffer) {
-  AddOrderMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(AddOrderMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
-  uint32_t shares = ntohl(msg.shares);
-  double price = ntohl(msg.price) / 10000.0;
-  std::string stockSymbol(msg.stockSymbol, sizeof(msg.stockSymbol));
-  std::cout << "\n--- Parsed Add Order ('A') ---" << std::endl;
-  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
-            << std::endl;
-  std::cout << "Side: " << msg.buySellIndicator << " | Shares: " << shares
-            << " | Symbol: " << stockSymbol << " | Price: " << price
-            << std::endl;
-}
-
-void parseAddOrderWithMPIDMessage(const char *a_buffer) {
-  AddOrderWithMPIDMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(AddOrderWithMPIDMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
-  uint32_t shares = ntohl(msg.shares);
-  double price = ntohl(msg.price) / 10000.0;
-  std::string stockSymbol(msg.stockSymbol, sizeof(msg.stockSymbol));
-  std::string attribution(msg.attribution, sizeof(msg.attribution));
-  std::cout << "\n--- Parsed Add Order w/ MPID ('F') ---" << std::endl;
-  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
-            << std::endl;
-  std::cout << "Side: " << msg.buySellIndicator << " | Shares: " << shares
-            << " | Symbol: " << stockSymbol << " | Price: " << price
-            << " | MPID: " << attribution << std::endl;
-}
-
-void parseOrderExecutedMessage(const char *a_buffer) {
-  OrderExecutedMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(OrderExecutedMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
-  uint32_t executedShares = ntohl(msg.executedShares);
-  uint64_t matchNumber = __builtin_bswap64(msg.matchNumber);
-  std::cout << "\n--- Parsed Order Executed ('E') ---" << std::endl;
-  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
-            << std::endl;
-  std::cout << "Executed Shares: " << executedShares
-            << " | Match #: " << matchNumber << std::endl;
-}
-
-void parseOrderExecutedWithPriceMessage(const char *a_buffer) {
-  OrderExecutedWithPriceMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(OrderExecutedWithPriceMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
-  uint32_t executedShares = ntohl(msg.executedShares);
-  uint64_t matchNumber = __builtin_bswap64(msg.matchNumber);
-  double executionPrice = ntohl(msg.executionPrice) / 10000.0;
-  std::cout << "\n--- Parsed Order Executed w/ Price ('C') ---" << std::endl;
-  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
-            << std::endl;
-  std::cout << "Executed Shares: " << executedShares
-            << " | Match #: " << matchNumber << " | Price: " << executionPrice
-            << std::endl;
-}
-
-void parseOrderCancelMessage(const char *a_buffer) {
-  OrderCancelMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(OrderCancelMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
-  uint32_t canceledShares = ntohl(msg.canceledShares);
-  std::cout << "\n--- Parsed Order Cancel ('X') ---" << std::endl;
-  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
-            << " | Canceled Shares: " << canceledShares << std::endl;
-}
-
-void parseOrderDeleteMessage(const char *a_buffer) {
-  OrderDeleteMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(OrderDeleteMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint64_t orderRef = __builtin_bswap64(msg.orderReferenceNumber);
-  std::cout << "\n--- Parsed Order Delete ('D') ---" << std::endl;
-  std::cout << "Timestamp: " << timestamp << " | Order Ref: " << orderRef
-            << std::endl;
-}
-
-void parseOrderReplaceMessage(const char *a_buffer) {
-  OrderReplaceMessage msg;
-  std::memcpy(&msg, a_buffer, sizeof(OrderReplaceMessage));
-  uint64_t timestamp = reconstructTimestamp(msg.timestamp);
-  uint64_t originalOrderRef =
-      __builtin_bswap64(msg.originalOrderReferenceNumber);
-  uint64_t newOrderRef = __builtin_bswap64(msg.newOrderReferenceNumber);
-  uint32_t shares = ntohl(msg.shares);
-  double price = ntohl(msg.price) / 10000.0;
-  std::cout << "\n--- Parsed Order Replace ('U') ---" << std::endl;
-  std::cout << "Timestamp: " << timestamp << " | Orig Ref: " << originalOrderRef
-            << " -> New Ref: " << newOrderRef << std::endl;
-  std::cout << "New Shares: " << shares << " | New Price: " << price
-            << std::endl;
-}
 
 // --- Network Listener Function ---
 void listen_feed(const char *group, int port, char feed_id) {
@@ -309,7 +68,7 @@ void listen_feed(const char *group, int port, char feed_id) {
   close(sock);
 }
 
-// --- Main Function ---
+// --- Main Function (Application Logic) ---
 int main() {
   const char *MCAST_GROUP = "239.0.0.1";
   const int MCAST_PORT_A = 5007;
@@ -369,9 +128,7 @@ int main() {
           break;
         default:
           std::cerr << "\nWarning: Unknown message type '" << messageType
-                    << "' at offset "
-                    << (current_pos - packet_to_process.data())
-                    << ". Stopping processing of this packet." << std::endl;
+                    << "'." << std::endl;
           current_pos = end_pos;
           continue;
         }
@@ -379,10 +136,8 @@ int main() {
         if (messageLength == 0) {
           break;
         }
-
         if (current_pos + messageLength > end_pos) {
-          std::cerr << "Error: Incomplete message of type '" << messageType
-                    << "'. Aborting packet." << std::endl;
+          std::cerr << "Error: Incomplete message." << std::endl;
           break;
         }
 
@@ -404,7 +159,6 @@ int main() {
                       << std::endl;
             expected_tracking_number = incoming_tracking_number;
           }
-
           if (incoming_tracking_number >= expected_tracking_number) {
             expected_tracking_number++;
           }
